@@ -56,28 +56,26 @@ This is the final project for **MACS 30123 — Large-Scale Computing for the Soc
 ### Rolling Realised Volatility  
 
 #### Volatility definition  
-For each stock *i* (identified by **PERMNO**) and window length *w* ∈ {1, 5, 22, 63} trading days, the **rolling realised volatility** on day *t* is
+For each stock *i* (identified by **PERMNO**) and window length \(w \in \{1,5,22,63\}\) trading days, the **rolling realised volatility** on day *t* is
 
-\[
-\sigma_{i,t}^{(w)} \;=\;
-\sqrt{\sum_{k=0}^{w-1} r_{i,t-k}^{\,2}},
-\]
+$$
+\sigma_{i,t}^{(w)} = \sqrt{\sum_{k=0}^{w-1} r_{i,t-k}^{2}}
+$$
 
 where the daily return  
 
+$r = \text{RET} \;\to\; \text{if missing}\Rightarrow \text{RETX} \;\to\; \text{if missing}\Rightarrow \text{DLRET}$  
 
-r =  RET   ⭢   if missing ⇒ RETX   ⭢   if missing ⇒ DLRET
-
-
-is first cleaned of single-letter codes ( `C`, `B`, … ) and cast to `double`.  
+is first cleaned of single-letter codes (`C`, `B`, …) and cast to `double`.
 
 We also create one-day-ahead targets
 
-\[
-y_{i,t}^{(w)} = \sigma_{i,t+1}^{(w)},
-\]
+$$
+y_{i,t}^{(w)} = \sigma_{i,t+1}^{(w)}
+$$
 
 to be used later in forecasting tasks.
+
 
 ---
 
