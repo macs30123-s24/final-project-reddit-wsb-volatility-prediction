@@ -10,7 +10,7 @@
 #SBATCH --mem=64G
 
 # 0) Software environment
-conda activate /project/dachxiu/zhengzhiyu/nlp5
+conda activate /home/zhengzhiyu6689/nlp5  
 module load java/21.0
 
 # 1) Derive Spark resource settings from Slurm variables
