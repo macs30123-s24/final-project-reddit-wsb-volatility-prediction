@@ -11,7 +11,7 @@ This is the final project for **MACS 30123 — Large-Scale Computing for the Soc
   - Reddit post data collection and cleaning
   - FinBERT embedding creation
 - Zhiyu Zheng:
-  - CRSP data collection and cleaning
+  - Financial data collection and cleaning
   - Predictioin model training and evaluation
 
 ## 2 Research Questions
@@ -77,8 +77,6 @@ $$
 to be used later in forecasting tasks.
 
 
----
-
 #### Spark pipeline & parallelisation  
 
 The job is executed on RCC Midway3 with the Slurm script `sbatch_vol_cal.sh`.  
@@ -115,6 +113,31 @@ graph TD
 
 With `--master local[$SLURM_CPUS_PER_TASK]` the driver launches a multi-threaded Spark instance that uses all 32 CPU cores requested from Slurm (`--cpus-per-task=32`).
 Driver memory is capped at **60 GB** (`--driver-memory 60g`), leaving 4 GB for the OS/Python overhead.
+
+The rolling volatility results are written to a **Parquet** file partitioned by **PERMNO** (stock identifier), which matches the layout of the CRSP blocks. This allows downstream jobs to scan only the slices they need, significantly speeding up data access.
+
+#### Embedding ⇆ Financial data Join 
+
+First, the FinBERT-embedding table and the cleaned-text table are both repartitioned on **id**; that puts the matching rows on the same executor, so Spark can join them map-side with zero network shuffle before writing a temporary “id-level” result.In the second pass we read that temporary file, broadcast the tiny 〈date, ticker → PERMNO〉 lookup to every executor, and add the PERMNO field with an in-memory hash join.  The final dataset is then repartitioned by **PERMNO** and written as Snappy-compressed Parquet, matching the layout of your CRSP blocks so that downstream stock-level jobs can scan only the slices they need.
+
+
+```mermaid
+flowchart LR
+    %% Sources
+    E[FinBERT<br/>Embeddings] -->|repartition id<br/>cache| X[Embeddings]
+    P[Clean Posts]            -->|repartition id<br/>cache| Y[Posts]
+    L[Ticker→PERMNO<br/>Lookup] -->|broadcast| B[Map]
+
+    %% Joins
+    Y -->|id| J1{Join #1}
+    X --> J1
+    J1 -->|date & ticker| J2{Join #2}
+    B  --> J2
+
+    %% Sink
+    J2 -->|repartition PERMNO<br/>write Parquet| S[reddit_full1<br/>partitioned]
+
+```
 
 # prediction model training and evaluation
 ## Benchmark model
@@ -153,7 +176,7 @@ flowchart TD
     subgraph year["Year-y pipeline"]
         direction TB
         train[/"Train set<br/>(y-4 … y-1)"/] --> trvec[["VectorAssembler"]]
-        trvec --> fit["⚙️ LinearRegression.fit<br/>(distributed)"]
+        trvec --> fit[" LinearRegression.fit<br/>(distributed)"]
 
         test[/"Test set<br/>(y)"/] --> tevec[["VectorAssembler"]]
         fit -. "β̂ broadcast" .- tevec         
@@ -193,9 +216,9 @@ flowchart TD
     eval --> task32
 
     %% --------- 计算结果回传给 Driver ----------
-    task1 -. partial XᵀX 等 .-> driver
-    task2 -. partial XᵀX 等 .-> driver
-    task32 -. partial XᵀX 等 .-> driver
+    task1 -. partial XᵀX  .-> driver
+    task2 -. partial XᵀX  .-> driver
+    task32 -. partial XᵀX  .-> driver
     task1 -. prediction splits .-> driver
     task2 -. prediction splits .-> driver
     task32 -. prediction splits .-> driver
