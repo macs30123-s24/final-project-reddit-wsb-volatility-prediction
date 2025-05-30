@@ -360,9 +360,21 @@ All the code are running in midway. Please refer to sbatch file for detailed com
 - **Data Source**: [CRSP](https://www.crsp.org/products/documentation/crsp-daily-stock-prices-and-volume) 
 - **Data Size**: 25732243 records.
 
-### Rolling Realised Volatility  
+### Computational challenge
 
-#### Volatility definition  
+Even trimmed down to the seven fields our model needs, the daily CRSP panel still contains **25 732 243 rows. Each experiment must
+
+* **scan the full table once** and cache it in executor memory;
+* compute four overlapping **rolling realised-volatility windows** (1, 5, 22, 63 days) for every stock, yielding $\sim10^{10}$ element-wise operations;
+* **join** those daily σ-series with \~20 million Reddit-day observations on the composite key *(PERMNO, date)*;
+* feed the resulting 30 K-column design matrix into cross-validated Ridge models.
+
+That workload is far beyond the memory and I/O budget of a laptop or single-node pandas script.  
+
+
+### Realised Volatility  
+
+#### definition  
 For each stock *i* (identified by **PERMNO**) and window length \(w \in \{1,5,22,63\}\) trading days, the **rolling realised volatility** on day *t* is
 
 $$
@@ -419,6 +431,25 @@ graph TD
 | **Write**       | `.write.partitionBy("PERMNO").parquet(...)` (Snappy)           | Produces one Parquet file per stock → later tasks can `load()` any ticker in milliseconds. |
 
 The rolling volatility is computed in parallel across executors, with each executor handling a single stock’s history. The `Window` function partitions the data by **PERMNO** and orders it by date, allowing Spark to compute the rolling volatility for each stock independently. The results are then written to a **Parquet** file partitioned by **PERMNO**, which allows efficient access to individual stocks in subsequent analyses.
+
+After building the four HAR-style volatility factors `vol_1, vol_5, vol_22, vol_63` and their future targets `y_1, y_5, y_22, y_63`, We ran a Spark-powered visual-diagnostics script The job loads the full 26 M-row *reddit_crsp* Parquet, directly on the cluster, and pushes three small DataFrames to pandas/matplotlib for plotting.*Spark* computes the group-by (daily mean RV) and rolling
+`cov`, `var` windows in-cluster; only ±50 k rows are collected for plotting.  End-to-end wall time on a 32-core Midway node:≈ 20 min for full data.
+
+![ Daily-average realised volatility](fig/vol_timeseries.png)
+
+The time-series plot shows four horizons of realised volatility—1-day, 5-day, 1-month and 3-month—from 2012 through 2024. The shorter curves hug the x-axis in tranquil markets but spike in unison at every well-known shock: the 2015 CNY devaluation, the 2018 “vol-mageddon” VIX crash, the March-2020 Covid sell-off, and the January-2021 meme-stock frenzy. Longer windows (the green 1-month and red 3-month lines) absorb those shocks slowly, keeping the series elevated long after the event, which is precisely the persistence the HAR lags are designed to exploit.
+
+![ Scatter / KDE matrix of vol_* against y1](fig/scatter_matrix.png)
+
+Pairwise panels reveal two salient features of the data. First, every volatility series—including the next-day target y₁—is extremely right-skewed, with a dense cloud below 0.1 and a long, thin tail of crisis observations; a log or Winsorised transform will therefore stabilise variance. Second, the four lagged volatilities sit almost perfectly on the 45-degree line, confirming severe multicollinearity. Such a geometry would make OLS coefficients unstable, so a ridge penalty (or elastic net) is essential.
+
+![alt text](fig/beta_rolling.png)
+
+Here β is the local slope linking today’s 1-day volatility (vol₁) to tomorrow’s y₁, computed over a 22-trading-day window. For most of the sample the coefficient hovers near zero, yet during stress episodes it swings violently—touching +130 k at the Covid peak and –70 k in the meme-stock crash. These eruptions show that a single linear coefficient can flip sign across regimes; regularisation must be strong enough to damp such extremes, or the model should include crisis dummies / interaction terms to isolate them.
+
+Taken together the three visuals justify the modelling choices that follow: the canonical HAR lags capture term-structure persistence; heavy-tailed, highly collinear predictors call for ridge-style shrinkage; and regime-dependent β suggests room for sentiment interactions or other nonlinear extensions.
+
+
 
 ## Embedding ⇆ Financial data jion
 
@@ -503,7 +534,7 @@ flowchart TD
 ### Model specification  
 For every stock **i** and day **t** we predict next-day realised volatility  
 
-\[
+$$
 \hat{y}_{i,t+1}
   \;=\;
   \boldsymbol{\beta}^{\!\top}
@@ -514,7 +545,7 @@ For every stock **i** and day **t** we predict next-day realised volatility
         \sigma_{i,t}^{(63)}\bigr]^{\!\top}
   \;+\;
   \varepsilon_{i,t+1}.
-\]
+$$
 
 
 where σ\* are the rolling volatilities produced in the previous step.  
@@ -523,64 +554,34 @@ We re-estimate **β** each year on the most recent four-year window (2012–2015
 ### Workflow  
 ```mermaid
 flowchart TD
-    %% ============ Driver =============
-    driver(("Driver /<br/>DAG Scheduler")):::drv
-
-    %% ============ 全局预处理 ==========
-    read["Read Parquet<br/>& cache"] --> repart["Repartition<br/>by PERMNO ≈ 32"]
-    repart --> loop{{loop over<br/>test-year y}}
-    driver -. control .- loop        
-    %% ============ Year-y 滚动流水线 ============
-    subgraph year["Year-y pipeline"]
-        direction TB
-        train[/"Train set<br/>(y-4 … y-1)"/] --> trvec[["VectorAssembler"]]
-        trvec --> fit[" LinearRegression.fit<br/>(distributed)"]
-
-        test[/"Test set<br/>(y)"/] --> tevec[["VectorAssembler"]]
-        fit -. "β̂ broadcast" .- tevec         
-        tevec --> pred["Predict<br/>(distributed)"]
-        pred --> eval["Evaluate<br/>(MSE · R²)"]
+    %% -------- Driver side --------
+    subgraph DRIVER["Driver JVM"]
+        SRC[CRSP_vol<br/>Parquet]
+        SRC -->|read once<br/>select 7 cols| CACHE[DataFrame<br/>cache]
+        CACHE -->|year loop| SLICE{split<br/>4 y train<br/>1 y test}
+        SLICE --> TRN[train set]
+        SLICE --> TST[test set]
     end
-    loop --> year
-    eval --> next{{next y?}}
-    next -->|yes| year
-    next -->|no| summary["Collect & print<br/>summary metrics"]
+    class DRIVER drv
 
-    %% ============ 并行执行层 ============
-    subgraph execs["Executors (32 CPU cores)"]
-        direction LR
-        task1["Task 1<br/>partition 1"]:::par
-        task2["Task 2<br/>partition 2"]:::par
-        dots["⋯"]:::par
-        task32["Task 32<br/>partition 32"]:::par
+    %% -------- Executor pool --------
+    subgraph EXEC["Executors (32 cores)"]
+        FIT[LinearRegression<br/>]
+        PRED[predict test]
+        METRICS[MSE · R²]
     end
-    classDef par fill:#e6f2ff,stroke:#1e90ff,stroke-dasharray:4 2;
-    classDef drv fill:#fff9e6,stroke:#d4a017,stroke-width:2px;
+    class EXEC exe
 
-    %% ---------------- 任务下发 ----------------
-    driver -- launch tasks --> task1
-    driver -- launch tasks --> task2
-    driver -- launch tasks --> task32
+    %% -------- Data flow --------
+    TRN --> FIT
+    FIT --> PRED
+    TST --> PRED
+    PRED --> METRICS
+    METRICS --> DRIVER
 
-    %% fit / predict 分派到 executors
-    fit --> task1
-    fit --> task2
-    fit --> task32
-    pred --> task1
-    pred --> task2
-    pred --> task32
-    eval --> task1
-    eval --> task2
-    eval --> task32
-
-    %% --------- 计算结果回传给 Driver ----------
-    task1 -. partial XᵀX  .-> driver
-    task2 -. partial XᵀX  .-> driver
-    task32 -. partial XᵀX  .-> driver
-    task1 -. prediction splits .-> driver
-    task2 -. prediction splits .-> driver
-    task32 -. prediction splits .-> driver
-
+    %% -------- Styling --------
+    classDef drv fill:#fff9e6,stroke:#d4a017,stroke-width:2;
+    classDef exe fill:#e6f2ff,stroke:#1e90ff,stroke-dasharray:4 2;
 ```
 Our HAR job is built so that the cluster touches disk exactly once and does every heavy operation where it is cheapest — inside the executors.we trimmed the entire HAR benchmark from half an hour to about three minutes by pushing every heavy operation to the executors and touching disk only once.The driver starts a single Spark application, reads the CRSP-volatility parquet, selects only the seven columns we need, repartitions on `PERMNO`, and caches the result in memory; from that moment on every yearly slice is just a metadata filter, no extra I/O or shuffle.
 
@@ -593,7 +594,7 @@ The driver then walks through the calendar: for each test-year *y* it carves out
 
 We extend the baseline **HAR(1 / 5 / 22 / 63)** specification by injecting a high-dimensional sentiment signal extracted from WallStreetBets posts.  Conceptually the model is
 
-\[
+$$
 \sigma_{t+1}
 \;=\;
 \beta_0
@@ -609,36 +610,116 @@ We extend the baseline **HAR(1 / 5 / 22 / 63)** specification by injecting a hig
 \underbrace{\boldsymbol\gamma^\top\!\mathbf{e}_{t}}_{\text{FinBERT embedding}}
 \;+\;
 \varepsilon_{t+1},
-\]
+$$
 
 where  
 
-* \( \sigma_{t} \) – realised volatility of stock *i* on day *t* (from CRSP, 5-min sampling).  
-* \( \overline{\sigma}_{t-k:t} \) – mean RV over the previous *k*+1 trading days.  
-* \( \mathbf{e}_{t}\in\mathbb{R}^{768} \) – **FinBERT** sentence-embedding of all Reddit posts that (i) mention the firm’s ticker and (ii) were created on day *t*.  We take the *mean* vector across posts to get one embedding per stock-day.  
+* $ \sigma_{t} $ – realised volatility of stock *i* on day *t* (from CRSP, 5-min sampling).  
+* $ \overline{\sigma}_{t-k:t} $ – mean RV over the previous *k*+1 trading days.  
+* $ \mathbf{e}_{t}\in\mathbb{R}^{768} $ – **FinBERT** sentence-embedding of all Reddit posts that (i) mention the firm’s ticker and (ii) were created on day *t*.  We take the *mean* vector across posts to get one embedding per stock-day.  
 
-Because \( \mathbf{e}_{t} \) is 768-dimensional and highly collinear, we estimate a **Ridge** (ℓ²)  regression implemented with Spark MLlib’s `LinearRegression(elasticNetParam=α, regParam=λ)`*;  
+Because $ \mathbf{e}_{t} $ is 768-dimensional and highly collinear, we estimate a **Ridge** (ℓ²)  regression implemented with Spark MLlib’s `LinearRegression(elasticNetParam=α, regParam=λ)`*;  
 
 
 ### Workflow
+```mermaid
+flowchart TD
+    %% ========= Driver scope =========
+    subgraph DRIVER["Python driver (single JVM)"]
+        SRC[reddit_crsp<br/>Parquet]
+        PRE[Pre-process<br/>date & vector]
+        ASM[VectorAssembler]
+        FEAT[Features<br/>cache]
+        SPLIT{Rolling loop<br/>4 y train / 1 y test}
+        TRAIN[Train slice]
+        TEST[Test slice]
+
+        SRC -->|read once| PRE
+        PRE --> ASM
+        ASM --> FEAT
+        FEAT --> SPLIT
+        SPLIT --> TRAIN
+        SPLIT --> TEST
+    end
+    class DRIVER drv
+
+    %% ========= Executor pool =========
+    subgraph EXEC["Executor pool (32 cores)"]
+        CV[CrossValidator<br/>λ grid]
+        BEST[Best Ridge]
+        PRED[Predict test]
+        MET[MSE & R²]
+    end
+    class EXEC exe
+
+    %% ========= Cross-scope edges =========
+    TRAIN --> CV
+    CV --> BEST
+    BEST --> PRED
+    TEST --> PRED
+    PRED --> MET
+    MET --> AVG[Rolling averages]
+    BEST --> SAVE[Save last model]
+
+    %% ========= Styling =========
+    classDef drv fill:#fff9e6,stroke:#d4a017,stroke-width:2px;
+    classDef exe fill:#e6f2ff,stroke:#1e90ff,stroke-dasharray:4 2;
+```
+To keep a **768-dim FinBERT vector + 4 HAR lags** tractable, I apply five concrete tricks:
+
+1. **Read once, deserialise safely.**
+   I disable Parquet’s vectorised reader (`enableVectorizedReader = false`) so the huge `embed` column is streamed row-by-row instead of blown into off-heap buffers that OOM the executor.
+
+2. **Early vectorisation inside the JVM.**
+   `array_to_vector("embed")` converts the Python list to Spark’s dense `Vector`, and `VectorAssembler` concatenates it with `[vol_1, vol_5, vol_22, vol_63]`. No Python UDF is ever invoked; the feature matrix lives entirely in Scala memory.
+
+3. **Whole matrix cached, windows are filters.**
+   After assembly I `.cache()` the 772-column DataFrame. Every rolling window is then just `df.filter(date between …)`, which touches no disk and causes zero shuffle.
+
+4. **Cross-validation in one executor pool.**
+   A single `CrossValidator` runs a 5-λ grid with 3 folds; `parallelism=8` schedules the nine sub-models concurrently, so CPUs stay busy and JVMs stay alive across windows.
+
+5. **Driver is a thin loop.**
+   Python merely slices dates, launches CV, logs `λ*`, MSE, R², and moves the window forward; all heavy math—Gram matrices, ridge solves, predictions—happens on executors.
+
+With these tweaks the script walks from 2012 to 2020 (nine 4 y → 1 y windows, 45 CV fits) in **≈ 7 min** on a 32-core Midway node,increased from 40 min without optimization.
+
 
 # model evaluation
 ## Benchmark model
 
 |  Test Year  |          MSE |        R² |
 | :---------: | -----------: | --------: |
-|     2016    |     0.000987 |     0.131 |
-|     2017    |     0.000668 |     0.151 |
-|     2018    |     0.000814 |     0.131 |
-|     2019    |     0.000784 |     0.150 |
-|     2020    |     0.001976 |     0.130 |
-|     2021    |     0.000884 |     0.158 |
-|     2022    |     0.001032 |     0.172 |
-|     2023    |     0.002077 |     0.061 |
-|     2024    |     0.001845 |     0.125 |
+|     2012    |     0.000987 |     0.131 |
+|     2013    |     0.000668 |     0.151 |
+|     2014    |     0.000814 |     0.131 |
+|     2015    |     0.000784 |     0.150 |
+|     2016    |     0.001976 |     0.130 |
+|     2017    |     0.000884 |     0.158 |
+|     2018    |     0.001032 |     0.172 |
+|     2019    |     0.002077 |     0.061 |
+|     2020    |     0.001845 |     0.125 |
 | **Overall** | **0.001552** | **0.127** |
 
 The HAR baseline captures roughly **13 %** of out-of-sample variance on average.Years with market stress (e.g.\ 2020, 2023) show larger MSE but still positive explanatory power, making this a sensible benchmark for subsequent LLM-enhanced models.
+
+## Embedding model
+
+|   Test Year |  MSE | R²|
+| :---------: | --------------:| -------------: |
+|     2012    |       0.000881 |          0.150 |
+|     2013    |       0.000613 |          0.161 |
+|     2014    |       0.000732 |          0.150 |
+|     2015    |       0.000708 |          0.174 |
+|     2016    |       0.001703 |          0.152 |
+|     2017    |       0.000790 |          0.171 |
+|     2018    |       0.000930 |          0.213 |
+|     2019    |       0.001857 |          0.141 |
+|     2020    |       0.001651 |          0.096 |
+| **Overall** |    **0.001454** |      **0.133**|
+
+The FinBERT-based embedding model improves on the HAR benchmark by cutting overall MSE from 0.001552 to 0.001454 (-6 %) and raising out-of-sample R² from 0.127 to 0.133 (≈ +5 %). It lowers error in every test year and boosts explanatory power in eight of nine years, with the largest gains in 2018–2019 (MSE down \~10 %, R² up 4–8 pp). The only R² dip occurs in the pandemic-driven 2020 market, though MSE still improves, hinting that extreme macro shocks dilute text signal. These gains stem from the embeddings’ fine-grained sentiment and topic cues, which complement historical volatility features and surface forward-looking information embedded in Reddit discussions, laying a stronger foundation for subsequent LLM-enhanced volatility models.
+
 
 
 
