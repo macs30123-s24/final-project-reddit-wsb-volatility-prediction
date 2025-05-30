@@ -44,6 +44,313 @@ This is the final project for **MACS 30123 — Large-Scale Computing for the Soc
 
 ## Reddit r/WSB post dats
 
+### Large-Scale Ingestion & Ticker-Aware Merge
+
+#### 1 Computational challenge
+
+The raw WallStreetBets dump ships as two Zstandard-compressed line-delimited JSON files (posts + comments, 7.8 GB compressed, ≈ 50 GB decompressed, 89 million rows, 20 string columns).  
+On a single node this workload is prohibitive:
+
+- **IO bound** — CPU-side streaming decompression of Zstd and JSON parsing saturate a core at < 20 MB s⁻¹; full decode would take several hours.
+- **Memory bound** — naive `.collect()`/in-memory manipulations would exceed commodity RAM once the text columns expand.
+- **Shuffle heavy** — matching every Reddit mention against 29 000 CRSP tickers and time-stamping them requires a wide join that normally triggers multi-GB network shuffles.
+
+A scalable, fault-tolerant ETL pipeline was therefore required.
+
+#### 2 Workflow design
+
+#### Stage overview 
+
+we ingest two compressed PushShift dumps (posts & comments) straight from S3, decode them on a Spark cluster, and keep only the fields we need. After merging the streams we use a vectorised regex to pull every `$TICKER` mention, broadcast-join those hits to a 27 k-row CRSP lookup table, and drop mentions that fall outside each ticker’s life span. The cleansed results are repartitioned and written back to S3 as Parquet partitioned by ticker, giving the next FinBERT step a lake it can query in seconds rather than hours.
+
+#### Parallel design
+- **Elastic cluster + adaptive decompression (robust ingest)**  
+  - **Infrastructure**  
+    The job runs on an EMR 6.15 / Spark 3.4 (YARN) cluster—one `m5.xlarge` master plus five `r5.xlarge` core nodes, for a total of 20 vCPUs and 160 GB RAM. HDFS and S3A are pre-wired and the fleet can scale out on demand.  
+  - **Dual-path decompression—fast when possible, reliable everywhere.**  
+    - **Preferred fast-path – JVM streaming.**  
+      When the runtime can load `org.apache.hadoop.io.compress.ZStandardCodec` (we ship `hadoop-zstd.jar` on the class-path), `spark.read.text` decompresses Zstandard bytes inside each mapper and yields UTF-8 lines. This bypasses Python, the GIL and all serialization overhead, cutting ingest time to roughly half of the pure-Python baseline.  
+    - **Automatic fallback – partition-parallel Python.**  
+      If the codec is unavailable or version-mismatched, the code transparently switches to a Python fallback: `binaryFiles` → `zstandard.ZstdDecompressor` → RDD-to-DataFrame. Though a bit slower than the JVM route, it still leverages Spark partitioning and keeps the workload fully parallel.
+   - This adaptive strategy delivers a better IO throughput on codec-equipped clusters, while providing robust ETL pipeline across diverse environment.
+
+- **Zero-copy decompression**  
+  Each mapper streams the Zstandard archives through Hadoop’s `ZStandardCodec` (`spark.read.text`), converting bytes → UTF-8 lines inside the JVM. This bypasses Python, the GIL, and serialization, cutting ingest time roughly in half compared with a Python-side zstandard fallback.
+
+- **Catalyst-driven transformations** (no shuffles where they hurt)  
+  - **Early slimming**  
+    A five-field `from_json` schema drops fifteen unused Reddit columns before any shuffle, shrinking every row that moves across the wire.  
+  - **Schema unification**  
+    Posts and comments are harmonized (`body` → `selftext`, null `title`) and stitched via `unionByName`—a metadata-only merge that costs near-zero CPU.  
+  - **Vectorized mining**  
+    Ticker candidates are extracted with a single Catalyst expression (`regexp_extract_all` → `explode`), fanning out work across all partitions—no Python UDF penalty.  
+  - **Shuffle-free equity lookup**  
+    The 27 k-row CRSP table is broadcast to every executor; each partition performs an in-memory hash probe and applies an epoch filter (`created_utc ∈ [start_ts,end_ts]`), so not a byte crosses the network for this join.
+
+- **Output layout, balance, and fault tolerance**  
+  - **Even work, cheap reads**  
+    The resulting DataFrame is repartitioned to 200 slices and written as Parquet on S3 partitioned by ticker. Downstream FinBERT steps therefore scan only the tickers they need with predicate push-down.  
+  - **Resilience**  
+    A `persist(StorageLevel.DISK_ONLY)` checkpoint after the heavy union guarantees an executor crash never forces a 7.8 GB re-read from S3.
+ 
+- **Spark knobs** (for completeness):  
+  - `3 executors × 4 cores × 20 GB RAM (+4 GB overhead)`  
+  - `spark.sql.shuffle.partitions = 120`  
+  - `Adaptive Query Execution = on`  
+  - `driver memory = 8 GB`
+
+
+```mermaid
+graph TD
+    %% ────────── sources (fan-out begins) ──────────
+    PZ["posts.zst"] ---|partitioned read| PDEC["adaptive decode<br>(per partition)"]
+    CZ["comments.zst"] ---|partitioned read| CDEC["adaptive decode<br>(per partition)"]
+
+    %%  decode detail
+    PDEC -->|JVM&nbsp;codec ♦<br>or<br>Python fallback ♦| PJ5["from_json + prune (5 cols)"]
+    CDEC -->|JVM&nbsp;codec ♦<br>or<br>Python fallback ♦| CJ5["from_json + prune (5 cols)"]
+
+    %% ────────── merge & unification (still distributed) ──────────
+    PJ5 --> UNI["unionByName&nbsp;+<br>body→selftext<br>(distributed)"]
+    CJ5 --> UNI
+
+    %% ────────── ticker mining ──────────
+    UNI --> RX["regexp_extract_all → explode<br>($?[A-Z]{1-5})"]
+    CRSP["CRSP tickers<br>27 k rows"] -- broadcast --> RX
+
+    %% join + filter
+    RX --> FILT["in-life-span filter<br>(created_utc ∈ [start_ts,end_ts])"]
+
+    %% ────────── shuffle tuning & lake write ──────────
+    FILT --> RP["repartition(200)"]
+    RP   --> W["write Parquet to S3<br>partitionBy(ticker)"]
+
+    %% styling
+    classDef step fill:#e8f3ff,stroke:#036,stroke-width:1px;
+    class PDEC,CDEC,PJ5,CJ5,UNI,RX,FILT,RP,W step;
+
+
+
+```
+
+#### 3 Execution environment & reproducibility
+
+
+- **Cluster provisioning**  
+  AWS EMR 6.15 with Spark 3.4 on YARN; one `m5.xlarge` master and five `r5.xlarge` core nodes (total 20 vCPUs / 160 GB RAM). JupyterHub is installed by EMR so all notebooks run inside the cluster.
+
+- **Bootstrap**  
+  A custom wheel bundle for Python 3.7 that pre-installs `zstandard==0.21` plus the Hadoop Zstd codec (`hadoop-zstd.jar`). This lets the job take the JVM fast-path when the codec loads, but still use the Python fallback if it does not.
+
+- **Spark session settings**  
+  - 3 executors × 4 cores × 20 GB executor memory (+4 GB overhead)  
+  - driver memory = 8 GB  
+  - `spark.sql.shuffle.partitions = 120`  
+  - Adaptive Query Execution enabled  
+  - The codec jar is added to both driver and executor classpaths.
+
+- **Data lake layout**  
+  All artefacts live in the S3 bucket:  
+  `s3a://wsb-research-data-shef-20250522/`
+
+  - `raw/wsb24/` → original Zstd Reddit dumps  
+  - `stage01_union_parquet/` → posts ∪ comments (88.9 M rows)  
+  - `stage02_by_ticker/` → Parquet, partitioned by ticker, ready for FinBERT
+
+#### 4. Estimated improvements
+
+| **Execution mode (EMR, 5 nodes)**                  | **Wall-time (cold run)\*** | **Why it matters**                                                                                   |
+| -------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------ |
+| Spark – Python fallback                            | ≈ 45 min                    | Partition-level parallelism already spreads decompression and parsing over 12 cores (3 executors × 4). |
+| *(each executor uses zstandard + JSON parsing in Python)* |                             |                                                                                                        |
+| Spark – JVM fast path                              | ≈ 30 min                    | Decompression shifts into the JVM; ingest phase roughly halves, the rest of the pipeline scales linearly with CPU. |
+| *(Hadoop Zstd codec available)*                    |                             |                                                                                                        |
+
+\* Times come from representative cold-cache runs on a 1 × `m5.xlarge` + 5 × `r5.xlarge` cluster; warm re-runs complete in under 10 minutes.
+
+
+
+### Embedding generation
+
+#### 1 Computational bottleneck
+
+- **Raw-text cleansing (25 M posts & comments)**  
+  Removing hyperlinks, markdown artefacts, and null rows looks trivial, yet a naïve `pandas` loop must stream tens of gigabytes through the Python interpreter. Regex on such volume keeps a single core busy “forever” and quickly overruns common 16 GB RAM limits.
+
+- **Sub-token generation**  
+  Hugging Face’s fast tokenizer is written in C++, but driving it from Python one record at a time serialises every sentence, keeping only one CPU busy. With millions of sentences this phase inflates to multi-hour runtimes and still leaves us with the real heavyweight—FinBERT.
+
+- **FinBERT embedding**  
+  Extracting one 768-dimensional CLS vector per post is naturally GPU-friendly, but raw Hugging Face defaults do not parallelise the way this course expects. A stock script that simply calls `model(**token_batch)` inside a Python for-loop (`batch ≈ 32`, FP32 weights) keeps just a fraction of a single GPU busy and quickly bumps into VRAM limits.
+
+
+#### 2. Work Flow
+
+#### 2.1 Job overview
+We load the 21 million row WSB posts from their 200-part Parquet lake into Spark, strip URLs and markdown with vectorised regex, and keep only id, created_utc, ticker, and cleaned text. 
+
+Then, We also use spark to broadcast finBERT's tokenizer, so every core turns sentences into fixed-length token arrays that matches the model, which are saved back to Parquet already grouped by ticker. Finally, we use a Python driver to stream those tokens through FinBERT and generate embeddings.
+
+#### 2.2 Parellel Design
+
+
+##### 2.2.1 Data Cleaning
+
+We use a local[32] Spark session to conduct basic cleaning of reddit texts.
+
+- **Vectorised operators**  
+   We scrub out links and markdown using Spark’s built-in regex and filter functions `regexp_replace' , so the cleaning happens entirely inside the Spark executors without loops.
+
+- **Balanced partitions**  
+  A `repartition(200)` call reshuffles the 21 M rows into roughly 100k-row chunks—large enough to amortise scheduling overhead, yet small enough to stay in cache—keeping all cores busy start-to-finish.
+
+The graph above shows the detailed workflow:
+```mermaid
+graph TD
+    A["SparkSession local32\nRead stage02 Parquet"] --> B["Repartition 200 parts"]
+    B --> C{"32 executors\nfilter + regexp_replace"}
+
+    subgraph "Executors 0–31"
+        direction LR
+        X1["filter + regex\npartition #1"]
+        X2["filter + regex\npartition #2"]
+        DOTS["⋯"]:::ellipsis
+        X32["filter + regex\npartition #200"]
+    end
+
+    C -->|fork| X1 & X2 & X32
+    X1 & X2 & X32 --> D["select needed cols\ntrim / lowercase"]
+    D --> E["Write Parquet\nstage03_clean (200 parts)"]
+
+    classDef ellipsis fill:transparent,stroke-width:0;
+
+```
+
+
+
+
+
+##### 2.2.2 Tokenization
+
+- **Even workload split**  
+  A preliminary `repartition(200)` reshuffles the 21 M rows into equal-sized slices, so every Spark executor inherits a similar amount of work and no CPU core sits idle.
+
+- **Cluster-wide broadcast of the tokenizer**  
+  The Hugging Face tokenizer is loaded once on the driver and broadcast to all Spark executors, so each worker thread can reuse the same object instead of re-instantiating it for every row.
+
+- **Partition-level tokenisation**  
+  Tokenisation happens inside `mapPartitions`: every executor processes its whole chunk of rows locally, calling the tokenizer’s native (Rust/C++) code in a tight loop. This keeps the heavy work off the Python driver and lets all CPU cores run in parallel.
+
+- **Fixed-size padding for GPU efficiency**  
+  During tokenisation we truncate or pad every sentence to 32 / 64 tokens, producing rectangular arrays that downstream GPU kernels can copy and multiply without extra shape logic.
+
+- **Domain-aware shuffle**  
+  A final `repartition("ticker")` groups all posts that mention the same stock symbol into the same output file; later per-ticker analyses—or our FinBERT step—can then scan one contiguous partition instead of touching the whole dataset.
+
+- **Columnar, compressed output**  
+  The resulting `input_ids` and `attention_mask` arrays are written as Parquet with Zstandard compression, keeping the lake both storage-friendly and analytics-ready.
+
+
+The graph below shows the detailed workflow of tokenization
+
+```mermaid
+graph TD
+    A["read stage03_clean: the cleaned reddit text"] --> B["Repartition (200 slices)"]
+    B --> C{"Executors\nmapPartitions tok_part"}
+
+    subgraph "Executors 0‒15"
+        direction LR
+        P1["tokenise slice #1"]
+        P2["tokenise slice #2"]
+        DOTS["⋯"]:::ellipsis
+        P200["tokenise slice #200"]
+    end
+
+    C -->|broadcast tokenizer| P1 & P2 & P200
+    P1 & P2 & P200 --> D["Repartition by ticker"]
+    D --> E["Write Parquet (Zstd)\nstage03_tok"]
+
+    classDef ellipsis fill:transparent,stroke-width:0;
+
+```
+
+
+
+##### 2.2.3 Embedding
+
+We generate embedding pipeline under different computational resources: single GPU and multiple GPU. 
+
+For single GPU, we push mega-batches of ~2 000 sentences through FinBERT in FP16. This taps the card’s thousands of tensor cores simultaneously, while the host thread overlaps disk-to-RAM streaming and Parquet writing so we parallely conduct computations, memory transfers, and I/O process.
+
+
+
+##### Shared design across both scripts
+
+- **All hand-rolled, no “auto-magic.”**  
+  We do not call `accelerate`, `deepspeed`, or `DataParallel`. Instead, we write the scheduling logic ourselves so the course staff can see exactly where the parallelism lives.
+
+- **Lean model footprint.**  
+  FinBERT weights load in FP16 (`torch_dtype=torch.float16`), halving VRAM and letting us push a mega-batch of ≈ 2 000 sentences through each forward pass without risking OOM.
+
+- **Zero-copy data plumbing.**  
+  `pyarrow.dataset` streams one `RecordBatch` at a time from the Parquet token lake; we never materialise the full table in host RAM. After inference, we keep only the 768-d CLS vector, discarding token-level activations and shaving ~90 % off the PCIe transfer.
+
+- **One writer per worker.**  
+  Each process owns its own `ParquetWriter(part-XX)`, so no file locks or queueing—workers can flush results asynchronously while the GPU tackles the next batch.
+
+---
+
+### Different hardware situations
+
+| **Scenario**                  | **How we parallelise**                                                                                                                                               | **Why we keep it**                                                                                                                                 |
+|------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|
+| Single-GPU, `finbert_pipeline.py`  | One Python worker binds to the lone card, chews through fixed-size mega-batches, and writes a single Parquet shard.                                               | Acts as a baseline: shows that even without extra hardware we still employ batch-level parallelism and FP16 tricks to finish in a reasonable window. |
+| Multi-GPU, `finbert_pipeline1.py` | We call `torch.multiprocessing.spawn`, launching one identical worker per visible GPU. Batches are handed out round-robin (`batch_idx % world == rank`), so every card stays busy and no partition is processed twice. Each worker writes its own shard, giving near-linear scaling (4 × GPU ≈ 4 × speed). | Lets us study how much wall-time drops when we add hardware—perfect for the project’s “compare different parallel levels” goal.                    |
+
+#### 3. Computational environment:
+All the code are running in midway. Please refer to sbatch file for detailed computational resource.
+
+- **Cleaning + tokenisation node**  
+  • Partition: `caslake`  
+  • 32 CPUs  
+  • 128 GB RAM  
+  • 8 h wall-time  
+
+- **Single-GPU inference job**  
+  • 1 GPU 
+  • 16 CPUs  
+  • 120 GB RAM  
+  • 6 h wall-time  
+  • Runs `finbert_pipeline.py`
+
+- **Multi-GPU inference job**  
+  • 4 GPU 
+  • 32 CPUs  
+  • 200 GB RAM  
+  • 6 h wall-time  
+  • Runs `finbert_pipeline1.py`
+
+- **Key software**  
+  Python 3.9.19 · PyTorch 2.2.1 (+ cu118) · CUDA 11.8 · HF Transformers 4.37.2 · Spark 3.3.2
+
+
+#### 4 Performance snapshot
+
+- **Spark cleaning (32 CPU)**  
+  Finishes in roughly **8 minutes**, streaming 21 million rows through the regex filters without memory pressure.
+
+- **Spark tokenisation (16 CPU)**  
+  Converts every post to fixed-length sub-tokens in about **20 minutes**; CPU utilisation stays near 100 % throughout thanks to the map-partition pattern.
+
+- **FinBERT embedding**  
+  - **Single‐GPU run** (`finbert_pipeline.py`, 1 × A100):  
+    **1 h 47 m 02 s** for the entire corpus.  
+  - **Multi-GPU run** (`finbert_pipeline1.py`, 4 × A100):  
+    **20 m 27 s**, a ≈ **5× speed-up** that is close to linear given four cards working independently.
+
+
+
+
 
 ## CRSP trade-and-quote data
 ### Overview
@@ -310,11 +617,8 @@ where
 * \( \overline{\sigma}_{t-k:t} \) – mean RV over the previous *k*+1 trading days.  
 * \( \mathbf{e}_{t}\in\mathbb{R}^{768} \) – **FinBERT** sentence-embedding of all Reddit posts that (i) mention the firm’s ticker and (ii) were created on day *t*.  We take the *mean* vector across posts to get one embedding per stock-day.  
 
-Because \( \mathbf{e}_{t} \) is 768-dimensional and highly collinear, we estimate  
+Because \( \mathbf{e}_{t} \) is 768-dimensional and highly collinear, we estimate a **Ridge** (ℓ²)  regression implemented with Spark MLlib’s `LinearRegression(elasticNetParam=α, regParam=λ)`*;  
 
-* either a **Ridge** (ℓ²) or **Elastic-Net** (ℓ¹+ℓ²) regression  
-  *implemented with Spark MLlib’s `LinearRegression(elasticNetParam=α, regParam=λ)`*;  
-* or, as a robustness check, the first *K* = 50 principal components of \( \mathbf{e}_{t} \) and fit OLS on the reduced space.
 
 ### Workflow
 
