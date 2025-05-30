@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-author: Zhiyu
+benchmark.py
+A benchmark for HAR-style volatility prediction using a rolling window
+author: Zhiyu Zheng
 HAR-style rolling forecast:
     • target      : next-day volatility  (y_1)
     • regressors  : σ(1d), σ(5d), σ(22d), σ(63d)
