@@ -1,3 +1,22 @@
+
+"""
+crsp_vol_calculation
+author: Zhiyu Zheng
+
+Build daily realised-volatility panels from raw CRSP returns
+------------------------------------------------------------------------
+• Reads the big CRSP.csv   file (RET / RETX / DLRET) from disk.
+• Cleans those three return columns into one numeric 'ret'.
+• Repartitions by PERMNO so every stock lives in a single partition.
+• Computes rolling RV over 1, 5, 22, 63 trading-day windows.
+• Creates one-day-ahead targets  y_1 / y_5 / y_22 / y_63.
+• Writes the result as Snappy-compressed Parquet, partitioned by PERMNO,
+  so later jobs can open a single stock instantly.
+
+Run with: run_vol_calculation.sbatch
+"""
+
+
 import os
 from pyspark.sql import SparkSession, Window
 from pyspark.sql.functions import (
