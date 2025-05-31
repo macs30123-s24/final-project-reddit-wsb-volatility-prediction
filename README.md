@@ -598,7 +598,7 @@ For every stock **i** and day **t** we predict next-day realised volatility
 ```math
 \hat{y}_{i,t+1}
   \;=\;
-  \boldsymbol{\beta}^{\!\top}
+  {\beta}^{\!\top}
   \bigl[1,\,
         \sigma_{i,t}^{(1)},\,
         \sigma_{i,t}^{(5)},\,
@@ -662,7 +662,7 @@ We extend the baseline **HAR(1 / 5 / 22 / 63)** specification by injecting a hig
   + \underbrace{\beta_5\,\bar{\sigma}_{t-4:t}}_{\text{weekly}}
   + \underbrace{\beta_{22}\,\bar{\sigma}_{t-21:t}}_{\text{monthly}}
   + \underbrace{\beta_{63}\,\bar{\sigma}_{t-62:t}}_{\text{quarterly}}
-  + \underbrace{\boldsymbol{\gamma}^{\!\top}\mathbf{e}_t}_{\text{FinBERT}}
+  + \underbrace{{\gamma}^{\!\top}\mathbf{e}_t}_{\text{FinBERT}}
   + \varepsilon_{t+1}
 ```
 
