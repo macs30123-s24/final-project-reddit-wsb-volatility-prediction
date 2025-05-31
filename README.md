@@ -13,18 +13,16 @@ We then train elastic-net and LSTM models in parallel to forecast daily realized
 - Zherui Lu: 
   - Reddit post data collection and cleaning
   - FinBERT embedding creation
+  - Visualization
 - Zhiyu Zheng:
+  - Merging finance and text data
   - Financial data collection and cleaning
   - Predictioin model training and evaluation
-
-# Research Questions
-
-Can sentiment embeddings extracted from Reddit’s r/WallStreetBets improve the prediction of stock volatility?
+ 
 
 
 # Readme Navigation
 
-## README Navigation
 | Main Section                                    | Description                                                         |
 |-------------------------------------------------|---------------------------------------------------------------------|
 | [Responsibilities](#responsibilities)           | Team members and division of labor                                   |
@@ -38,7 +36,49 @@ Can sentiment embeddings extracted from Reddit’s r/WallStreetBets improve the 
 | [Model evaluation](#model-evaluation)           | Benchmark and embedding model performance results                    |
 
 
+# File Structure
 
+* **[data/](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/tree/main/data)** – data process code 
+  * **[reddit/](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/tree/main/data/reddit)**  
+    * **[Embedding/](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/tree/main/data/reddit/Embedding)** – Reddit-text preprocessing & FinBERT embadding 
+      * [clean.ipynb](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/blob/main/data/reddit/Embedding/clean.ipynb) – first-pass text cleaning  
+      * [finbert_pipeline.py](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/blob/main/data/reddit/Embedding/finbert_pipeline.py) – single-GPU Spark embedding job  
+      * [finbert_pipeline.sbatch](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/blob/main/data/reddit/Embedding/finbert_pipeline.sbatch) – Slurm wrapper for the above  
+      * [finbert_pipeline1.py](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/blob/main/data/reddit/Embedding/finbert_pipeline1.py) – multi-GPU (Horovod) variant  
+      * [finbert_pipeline1.sbatch](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/blob/main/data/reddit/Embedding/finbert_pipeline1.sbatch) – Slurm wrapper for the multi-GPU job  
+    * **[Merge/](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/tree/main/data/reddit/Merge)** – post ingestion & ticker tagging  
+      * [Merge_final_version.ipynb](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/blob/main/data/reddit/Merge/Merge_final_version.ipynb) – end-to-end merging prototype  
+  * **[reddit_volatility_merge/](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/tree/main/data/reddit_volatility_merge)** – Reddit × CRSP linkage  
+    * [reddit_full.py](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/blob/main/data/reddit_volatility_merge/reddit_full.py) – Generated reddit post and embaddings with permno.  
+    * [run_reddit_full.sbatch](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/blob/main/data/reddit_volatility_merge/run_reddit_full.sbatch) – Slurm job for `reddit_full.py`  
+    * [reddit_crsp_linkage.py](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/blob/main/data/reddit_volatility_merge/reddit_crsp_linkage.py) – CRSP-Reddit linkage script  
+    * [run_reddit_crsp_linkage.sbatch](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/blob/main/data/reddit_volatility_merge/run_reddit_crsp_linkage.sbatch) – Slurm job for reddit_crsp_linkage.py. 
+  * **[volatility/](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/tree/main/data/volatility)** – realised-volatility calculation  
+    * [crsp_vol_calculation.py](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/blob/main/data/volatility/crsp_vol_calculation.py) – 1/5/22/63-day RV generator  
+    * [run_vol_calculation.sbatch](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/blob/main/data/volatility/run_vol_calculation.sbatch) – Slurm job for crsp_vol_calculation.py  
+
+* **[fig/](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/tree/main/fig)** – figures and plots  
+  * [vol_timeseries.png](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/blob/main/fig/vol_timeseries.png) – average RV time-series  
+  * [scatter_matrix.png](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/blob/main/fig/scatter_matrix.png) – lagged σ vs target scatter matrix  
+  * [beta_rolling.png](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/blob/main/fig/beta_rolling.png) – 22-day rolling β plot  
+  * [volatility_fig.py](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/blob/main/fig/volatility_fig.py) – figure generation script  
+  * [run_volatility_fig.sbatch](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/blob/main/fig/run_volatility_fig.sbatch) – Slurm wrapper for volatility_fig.py
+
+* **[prediction/](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/tree/main/prediction)** – forecasting models & jobs  
+  * [benchmark.py](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/blob/main/prediction/benchmark.py) – HAR baseline (4-year train / 1-year test)  
+  * [embedding_model.py](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/blob/main/prediction/embedding_model.py) – FinBERT embeddings + Ridge + CV  
+  * [runbenchmark.sbatch](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/blob/main/prediction/runbenchmark.sbatch) – Slurm job for baseline  
+  * [run_embedding_model.sbatch](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/blob/main/prediction/run_embedding_model.sbatch) – Slurm job for embedding model  
+
+* **[README.md](https://github.com/macs30123-s24/final-project-reddit-wsb-volatility-prediction/blob/main/README.md)** – project README file.
+
+
+
+
+
+# Research Questions
+
+Can sentiment embeddings extracted from Reddit’s r/WallStreetBets improve the prediction of stock volatility?
 
 
 # Social Science Significance
@@ -379,8 +419,6 @@ All the code are running in midway. Please refer to sbatch file for detailed com
 - **Data Period**: 2012-2024
 - **Data Source**: [CRSP](https://www.crsp.org/products/documentation/crsp-daily-stock-prices-and-volume) 
 - **Data Size**: 25732243 records.
-
-### Computational challenge
 
 ### Computational challenge
 
