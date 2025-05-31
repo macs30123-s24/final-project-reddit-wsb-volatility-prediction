@@ -43,7 +43,8 @@ Can sentiment embeddings extracted from Reddit’s r/WallStreetBets improve the 
 
 # 1. Reddit WSB post data
 
-## 1.1 Large-Scale Ingestion & Ticker-Aware Merge
+
+### The code of this part is in [here](reddit/Merge/Merge_final_version.ipynb)
 
 ### Computational challenge
 
@@ -60,7 +61,7 @@ A scalable, fault-tolerant data ingestion pipeline was therefore required.
 
 #### Stage overview 
 
-First, we ingest two compressed wsb posts data set (posts and comments are stored speratly) from the S3 bucket we created (We upload the existing dataset into the S3 bucket)
+First, we ingest two compressed wsb posts data set (posts and comments are stored speratly) from the [S3 bucket](s3a://wsb-research-data-shef-20250522/) we created (We manually upload the existing dataset into the S3 bucket)
 
 We then decode them on a Spark cluster, and keep only the columns we need. After merging the streams, we use a vectorised regex to pull every `$TICKER` mention:
 
@@ -75,7 +76,7 @@ Finally, we broadcast-join those hits to an around 27000 row CRSP lookup table w
       When the runtime can load `org.apache.hadoop.io.compress.ZStandardCodec` (we ship `hadoop-zstd.jar` on the class-path), `spark.read.text` decompresses Zstandard bytes inside each mapper and yields UTF-8 lines. This bypasses Python, the GIL and all serialization overhead, cutting ingest time to roughly half of the pure-Python baseline.  
     - **Automatic fallback – partition-parallel Python.**  
       If the codec is unavailable or version-mismatched, the code transparently switches to a Python fallback: `binaryFiles` → `zstandard.ZstdDecompressor` → RDD-to-DataFrame. Though a bit slower than the JVM route, it still leverages Spark partitioning and keeps the workload fully parallel.
-   - This adaptive strategy delivers a better IO throughput on codec-equipped clusters, while providing robust ETL pipeline across diverse environment.
+   - This adaptive strategy delivers a better IO throughput on codec-equipped clusters, while providing robust pipeline across diverse environment.
 
 - **Zero-copy decompression**  
   Each mapper streams the Zstandard archives through Hadoop’s `ZStandardCodec` (`spark.read.text`), converting bytes → UTF-8 lines inside the JVM. This bypasses Python, the GIL, and serialization, cutting ingest time roughly in half compared with a Python-side zstandard fallback.
@@ -86,9 +87,9 @@ Finally, we broadcast-join those hits to an around 27000 row CRSP lookup table w
   - **Schema unification**  
     Posts and comments are harmonized (`body` → `selftext`, null `title`) and stitched via `unionByName`—a metadata-only merge that costs near-zero CPU.  
   - **Vectorized mining**  
-    Ticker candidates are extracted with a single Catalyst expression (`regexp_extract_all` → `explode`), fanning out work across all partitions—no Python UDF penalty.  
+    Ticker candidates are extracted with a single Catalyst expression (`regexp_extract_all` → `explode`), fanning out work across all partitions.  
   - **Shuffle-free equity lookup**  
-    The 27 k-row CRSP table is broadcast to every executor; each partition performs an in-memory hash probe and applies an epoch filter (`created_utc ∈ [start_ts,end_ts]`), so not a byte crosses the network for this join.
+    The around 27000 row CRSP table is broadcast to every executor; each partition performs an in-memory hash probe and applies an epoch filter (`created_utc ∈ [start_ts,end_ts]`), so not a byte crosses the network for this join.
 
 - **Output layout, balance, and fault tolerance**  
   - **Even work, cheap reads**  
@@ -96,11 +97,6 @@ Finally, we broadcast-join those hits to an around 27000 row CRSP lookup table w
   - **Resilience**  
     A `persist(StorageLevel.DISK_ONLY)` checkpoint after the heavy union guarantees an executor crash never forces a 7.8 GB re-read from S3.
  
-- **Spark knobs** (for completeness):  
-  - `3 executors × 4 cores × 20 GB RAM (+4 GB overhead)`  
-  - `spark.sql.shuffle.partitions = 120`  
-  - `Adaptive Query Execution = on`  
-  - `driver memory = 8 GB`
 
 The following graphs shows the more detailed pipeline:
 
@@ -168,10 +164,7 @@ graph TD
 | Spark – Python fallback                            | ≈ 45 min                    | Partition-level parallelism already spreads decompression and parsing over 12 cores (3 executors × 4). |
 | *(each executor uses zstandard + JSON parsing in Python)* |                             |                                                                                                        |
 | Spark – JVM fast path                              | ≈ 30 min                    | Decompression shifts into the JVM; ingest phase roughly halves, the rest of the pipeline scales linearly with CPU. |
-| *(Hadoop Zstd codec available)*                    |                             |                                                                                                        |
-
-\* Times come from representative cold-cache runs on a 1 × `m5.xlarge` + 5 × `r5.xlarge` cluster; warm re-runs complete in under 10 minutes.
-
+| *Note: The *                    |                             |                                                                                                        |
 
 
 ## 1.2 Embedding generation
@@ -587,9 +580,8 @@ flowchart TD
     METRICS --> DRIVER
 
     %% -------- Styling --------
-    classDef drv fill:#fff9e6,stroke:#d4a017,stroke-width:2px,color:#000;
-    classDef exe fill:#d0e6ff,stroke:#1e90ff,stroke-width:2px,color:#000;
-    
+    classDef drv fill:#fff9e6,stroke:#d4a017,stroke-width:2;
+    classDef exe fill:#e6f2ff,stroke:#1e90ff,stroke-dasharray:4 2;
 ```
 Our HAR job is built so that the cluster touches disk exactly once and does every heavy operation where it is cheapest — inside the executors.we trimmed the entire HAR benchmark from half an hour to about three minutes by pushing every heavy operation to the executors and touching disk only once.The driver starts a single Spark application, reads the CRSP-volatility parquet, selects only the seven columns we need, repartitions on `PERMNO`, and caches the result in memory; from that moment on every yearly slice is just a metadata filter, no extra I/O or shuffle.
 
@@ -602,31 +594,23 @@ The driver then walks through the calendar: for each test-year *y* it carves out
 
 We extend the baseline **HAR(1 / 5 / 22 / 63)** specification by injecting a high-dimensional sentiment signal extracted from WallStreetBets posts.  Conceptually the model is
 
-$$
+```math
 \sigma_{t+1}
-\;=\;
-\beta_0
-\;+\;
-\underbrace{\beta_1\sigma_{t}}_{\text{daily lag}}
-\;+\;
-\underbrace{\beta_5\overline{\sigma}_{t-4:t}}_{\text{weekly}}
-\;+\;
-\underbrace{\beta_{22}\overline{\sigma}_{t-21:t}}_{\text{monthly}}
-\;+\;
-\underbrace{\beta_{63}\overline{\sigma}_{t-62:t}}_{\text{quarterly}}
-\;+\;
-\underbrace{\boldsymbol\gamma^\top\!\mathbf{e}_{t}}_{\text{FinBERT embedding}}
-\;+\;
-\varepsilon_{t+1},
-$$
+  = \beta_0
+  + \underbrace{\beta_1 \sigma_t}_{\text{daily}}
+  + \underbrace{\beta_5\,\bar{\sigma}_{t-4:t}}_{\text{weekly}}
+  + \underbrace{\beta_{22}\,\bar{\sigma}_{t-21:t}}_{\text{monthly}}
+  + \underbrace{\beta_{63}\,\bar{\sigma}_{t-62:t}}_{\text{quarterly}}
+  + \underbrace{\boldsymbol{\gamma}^{\!\top}\mathbf{e}_t}_{\text{FinBERT}}
+  + \varepsilon_{t+1}
+```
 
-where  
 
-* $ \sigma_{t} $ – realised volatility of stock *i* on day *t* (from CRSP, 5-min sampling).  
-* $ \overline{\sigma}_{t-k:t} $ – mean RV over the previous *k*+1 trading days.  
-* $ \mathbf{e}_{t}\in\mathbb{R}^{768} $ – **FinBERT** sentence-embedding of all Reddit posts that (i) mention the firm’s ticker and (ii) were created on day *t*.  We take the *mean* vector across posts to get one embedding per stock-day.  
+* $\sigma_{t}$ – realised volatility of stock *i* on day *t* (from CRSP, 5-min sampling).  
+* $\overline{\sigma}_{t-k:t}$ – mean RV over the previous *k*+1 trading days.  
+* $\mathbf{e}_{t}\in\mathbb{R}^{768}$ – **FinBERT** sentence-embedding of all Reddit posts that (i) mention the firm’s ticker and (ii) were created on day *t*.  We take the *mean* vector across posts to get one embedding per stock-day.  
 
-Because $ \mathbf{e}_{t} $ is 768-dimensional and highly collinear, we estimate a **Ridge** (ℓ²)  regression implemented with Spark MLlib’s `LinearRegression(elasticNetParam=α, regParam=λ)`*;  
+Because $\mathbf{e}_{t}$ is 768-dimensional and highly collinear, we estimate a **Ridge** (ℓ²)  regression implemented with Spark MLlib’s `LinearRegression(elasticNetParam=α, regParam=λ)`*;  
 
 
 ### Workflow
@@ -670,8 +654,8 @@ flowchart TD
     BEST --> SAVE[Save last model]
 
     %% ========= Styling =========
-    classDef drv fill:#fff9e6,stroke:#d4a017,stroke-width:2px,color:#000;
-    classDef exe fill:#d0e6ff,stroke:#1e90ff,stroke-width:2px,color:#000;
+    classDef drv fill:#fff9e6,stroke:#d4a017,stroke-width:2px;
+    classDef exe fill:#e6f2ff,stroke:#1e90ff,stroke-dasharray:4 2;
 ```
 To keep a **768-dim FinBERT vector + 4 HAR lags** tractable, I apply five concrete tricks:
 
@@ -690,7 +674,7 @@ To keep a **768-dim FinBERT vector + 4 HAR lags** tractable, I apply five concre
 5. **Driver is a thin loop.**
    Python merely slices dates, launches CV, logs `λ*`, MSE, R², and moves the window forward; all heavy math—Gram matrices, ridge solves, predictions—happens on executors.
 
-With these tweaks the script walks from 2012 to 2020 (nine 4 y → 1 y windows, 45 CV fits) on a 16-core Midway node.
+With these tweaks the script walks from 2012 to 2020 (nine 4 y → 1 y windows, 45 CV fits) in **≈ 7 min** on a 32-core Midway node,increased from 40 min without optimization.
 
 
 # model evaluation
