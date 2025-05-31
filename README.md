@@ -595,7 +595,7 @@ flowchart TD
 ### Model specification  
 For every stock **i** and day **t** we predict next-day realised volatility  
 
-$$
+```math
 \hat{y}_{i,t+1}
   \;=\;
   \boldsymbol{\beta}^{\!\top}
@@ -606,7 +606,7 @@ $$
         \sigma_{i,t}^{(63)}\bigr]^{\!\top}
   \;+\;
   \varepsilon_{i,t+1}.
-$$
+```
 
 
 where σ\* are the rolling volatilities produced in the previous step.  
