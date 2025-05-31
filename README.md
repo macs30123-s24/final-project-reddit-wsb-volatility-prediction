@@ -227,7 +227,7 @@ graph TD
 
 
 
-##### 2.2.2 Tokenization
+#### Tokenization
 
 - **Even workload split**  
   A preliminary `repartition(200)` reshuffles the 21 M rows into equal-sized slices, so every Spark executor inherits a similar amount of work and no CPU core sits idle.
@@ -534,7 +534,7 @@ flowchart TD
 ### Model specification  
 For every stock **i** and day **t** we predict next-day realised volatility  
 
-$$
+```math
 \hat{y}_{i,t+1}
   \;=\;
   \boldsymbol{\beta}^{\!\top}
@@ -545,7 +545,7 @@ $$
         \sigma_{i,t}^{(63)}\bigr]^{\!\top}
   \;+\;
   \varepsilon_{i,t+1}.
-$$
+```
 
 
 where σ\* are the rolling volatilities produced in the previous step.  
@@ -598,9 +598,9 @@ We extend the baseline **HAR(1 / 5 / 22 / 63)** specification by injecting a hig
 \sigma_{t+1}
   = \beta_0
   + \underbrace{\beta_1 \sigma_t}_{\text{daily}}
-  + \underbrace{\beta_5\,\bar{\sigma}_{t-4:t}}_{\text{weekly}}
-  + \underbrace{\beta_{22}\,\bar{\sigma}_{t-21:t}}_{\text{monthly}}
-  + \underbrace{\beta_{63}\,\bar{\sigma}_{t-62:t}}_{\text{quarterly}}
+  + \underbrace{\beta_5\,\bar{\sigma}_{t-4·t}}_{\text{weekly}}
+  + \underbrace{\beta_{22}\,\bar{\sigma}_{t-21·t}}_{\text{monthly}}
+  + \underbrace{\beta_{63}\,\bar{\sigma}_{t-62·t}}_{\text{quarterly}}
   + \underbrace{\boldsymbol{\gamma}^{\!\top}\mathbf{e}_t}_{\text{FinBERT}}
   + \varepsilon_{t+1}
 ```
