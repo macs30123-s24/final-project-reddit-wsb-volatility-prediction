@@ -587,8 +587,9 @@ flowchart TD
     METRICS --> DRIVER
 
     %% -------- Styling --------
-    classDef drv fill:#fff9e6,stroke:#d4a017,stroke-width:2;
-    classDef exe fill:#e6f2ff,stroke:#1e90ff,stroke-dasharray:4 2;
+    classDef drv fill:#fff9e6,stroke:#d4a017,stroke-width:2px,color:#000;
+    classDef exe fill:#d0e6ff,stroke:#1e90ff,stroke-width:2px,color:#000;
+    
 ```
 Our HAR job is built so that the cluster touches disk exactly once and does every heavy operation where it is cheapest — inside the executors.we trimmed the entire HAR benchmark from half an hour to about three minutes by pushing every heavy operation to the executors and touching disk only once.The driver starts a single Spark application, reads the CRSP-volatility parquet, selects only the seven columns we need, repartitions on `PERMNO`, and caches the result in memory; from that moment on every yearly slice is just a metadata filter, no extra I/O or shuffle.
 
@@ -669,8 +670,8 @@ flowchart TD
     BEST --> SAVE[Save last model]
 
     %% ========= Styling =========
-    classDef drv fill:#fff9e6,stroke:#d4a017,stroke-width:2px;
-    classDef exe fill:#e6f2ff,stroke:#1e90ff,stroke-dasharray:4 2;
+    classDef drv fill:#fff9e6,stroke:#d4a017,stroke-width:2px,color:#000;
+    classDef exe fill:#d0e6ff,stroke:#1e90ff,stroke-width:2px,color:#000;
 ```
 To keep a **768-dim FinBERT vector + 4 HAR lags** tractable, I apply five concrete tricks:
 
