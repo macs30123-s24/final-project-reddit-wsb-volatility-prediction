@@ -359,8 +359,6 @@ All the code are running in midway. Please refer to sbatch file for detailed com
 
 ### Computational challenge
 
-### Computational challenge
-
 Even after we prune the CRSP file to the **seven columns** we actually need, the daily panel still weighs in at **25  732  243 rows**.  Processing it is hard for three reasons:
 
 1. **Sheer volume of rolling math** – For every stock we must slide four overlapping windows (1, 5, 22, 63 days) across the entire date range.  That is on the order of **10 billion elementary operations**, impossible to hold in RAM or loop through in pandas.
