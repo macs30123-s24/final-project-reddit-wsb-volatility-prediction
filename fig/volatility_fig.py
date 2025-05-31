@@ -2,7 +2,7 @@
 #!/usr/bin/env python3
 author: Zhiyu Zheng
 
-This script loads realized-volatility data from the Reddit–CRSP directory, 
+This script loads realized-volatility data from the Reddit-CRSP directory, 
 optionally samples it, and produces:
  1) A daily average volatility time series plot,
  2) A scatter‐matrix of volatility and returns,
