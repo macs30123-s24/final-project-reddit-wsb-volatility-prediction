@@ -1,9 +1,12 @@
-# High-Performance FinBERT pipelines mining r/WallStreeBet for volatility signals
+# High-Performance FinBERT pipelines mining:  Reddit WallStreeBet for volatility signals
 
-This is the final project for **MACS 30123 — Large-Scale Computing for the Social Sciences**, carried out by **Zhiyu Zheng** and **Zherui Lu**. In this work we implement large-scale computing—Spark, distributed GPUs, and AWS Batch on RCC—to mine and clean **\~20 million WallStreetBets Reddit posts (2012-2024)**, embed each post with **FinBERT**, and join the resulting 768-dimensional vectors with CRSP trade-and-quote data. We then train elastic-net and LSTM models in parallel to forecast daily realized volatility for US stock, evaluating performance with MSE, $R^{2}$. The project demonstrates how scalable NLP pipelines can transform retail-investor sentiment into actionable sigma-risk signals, fulfilling the course’s mandate to combine high-performance computing with social-science insight.
+This is the final project for **MACS 30123 — Large-Scale Computing for the Social Sciences**, carried out by **Zhiyu Zheng** and **Zherui Lu**. 
+
+In this work we implement large-scale computing—Spark, distributed GPUs, and AWS Batch on RCC—to mine and clean **\~90 million WallStreetBets Reddit posts (2012-2024)**, embed each post with **FinBERT**, and join the resulting 768-dimensional vectors with CRSP trade-and-quote data. 
+
+We then train elastic-net and LSTM models in parallel to forecast daily realized volatility for US stock, evaluating performance with MSE, $R^{2}$. The project demonstrates how scalable NLP pipelines can transform retail-investor sentiment into actionable sigma-risk signals, fulfilling the course’s mandate to combine high-performance computing with social-science insight.
 
 
-# README Navigation
 
 # Responsibilities
 
@@ -14,12 +17,9 @@ This is the final project for **MACS 30123 — Large-Scale Computing for the Soc
   - Financial data collection and cleaning
   - Predictioin model training and evaluation
 
-## 2 Research Questions
-1. **Collective Retail Voice → Volatility**  
-   Can sentiment embeddings extracted from Reddit’s r/WallStreetBets improve the prediction of stock volatility?
+# Research Questions
 
-2. **Value-Added of Embeddings**  
-   What part of the sentiment embeddings learned that is most predictive of volatility? 
+Can sentiment embeddings extracted from Reddit’s r/WallStreetBets improve the prediction of stock volatility?
 
 
 # Social Science Significance
@@ -40,28 +40,31 @@ This is the final project for **MACS 30123 — Large-Scale Computing for the Soc
   * Alternative data improve volatility forecasting beyond conventional signals.
 
 
-# Date
 
-## Reddit r/WSB post dats
+# 1. Reddit WSB post data
 
-### Large-Scale Ingestion & Ticker-Aware Merge
+## 1.1 Large-Scale Ingestion & Ticker-Aware Merge
 
-#### 1 Computational challenge
+### Computational challenge
 
 The raw WallStreetBets dump ships as two Zstandard-compressed line-delimited JSON files (posts + comments, 7.8 GB compressed, ≈ 50 GB decompressed, 89 million rows, 20 string columns).  
 On a single node this workload is prohibitive:
 
-- **IO bound** — CPU-side streaming decompression of Zstd and JSON parsing saturate a core at < 20 MB s⁻¹; full decode would take several hours.
+- **I/O bound** — CPU-side streaming decompression of Zstd and JSON parsing saturate a core at < 20 MB s⁻¹; full decode would take several hours.
 - **Memory bound** — naive `.collect()`/in-memory manipulations would exceed commodity RAM once the text columns expand.
 - **Shuffle heavy** — matching every Reddit mention against 29 000 CRSP tickers and time-stamping them requires a wide join that normally triggers multi-GB network shuffles.
 
-A scalable, fault-tolerant ETL pipeline was therefore required.
+A scalable, fault-tolerant data ingestion pipeline was therefore required.
 
-#### 2 Workflow design
+### Workflow design
 
 #### Stage overview 
 
-we ingest two compressed PushShift dumps (posts & comments) straight from S3, decode them on a Spark cluster, and keep only the fields we need. After merging the streams we use a vectorised regex to pull every `$TICKER` mention, broadcast-join those hits to a 27 k-row CRSP lookup table, and drop mentions that fall outside each ticker’s life span. The cleansed results are repartitioned and written back to S3 as Parquet partitioned by ticker, giving the next FinBERT step a lake it can query in seconds rather than hours.
+First, we ingest two compressed wsb posts data set (posts and comments are stored speratly) from the S3 bucket we created (We upload the existing dataset into the S3 bucket)
+
+We then decode them on a Spark cluster, and keep only the columns we need. After merging the streams, we use a vectorised regex to pull every `$TICKER` mention:
+
+Finally, we broadcast-join those hits to an around 27000 row CRSP lookup table which stores the ticker's information, and drop mentions that fall outside each ticker’s life span. The cleansed results are repartitioned and written back to S3 as Parquet partitioned by ticker, giving the next FinBERT step a lake it can query in seconds rather than hours.
 
 #### Parallel design
 - **Elastic cluster + adaptive decompression (robust ingest)**  
@@ -99,6 +102,7 @@ we ingest two compressed PushShift dumps (posts & comments) straight from S3, de
   - `Adaptive Query Execution = on`  
   - `driver memory = 8 GB`
 
+The following graphs shows the more detailed pipeline:
 
 ```mermaid
 graph TD
@@ -133,7 +137,7 @@ graph TD
 
 ```
 
-#### 3 Execution environment & reproducibility
+### Execution environment & reproducibility
 
 
 - **Cluster provisioning**  
@@ -157,7 +161,7 @@ graph TD
   - `stage01_union_parquet/` → posts ∪ comments (88.9 M rows)  
   - `stage02_by_ticker/` → Parquet, partitioned by ticker, ready for FinBERT
 
-#### 4. Estimated improvements
+### Estimated improvements
 
 | **Execution mode (EMR, 5 nodes)**                  | **Wall-time (cold run)\*** | **Why it matters**                                                                                   |
 | -------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------ |
@@ -170,9 +174,9 @@ graph TD
 
 
 
-### Embedding generation
+## 1.2 Embedding generation
 
-#### 1 Computational bottleneck
+### Computational bottleneck
 
 - **Raw-text cleansing (25 M posts & comments)**  
   Removing hyperlinks, markdown artefacts, and null rows looks trivial, yet a naïve `pandas` loop must stream tens of gigabytes through the Python interpreter. Regex on such volume keeps a single core busy “forever” and quickly overruns common 16 GB RAM limits.
@@ -184,17 +188,17 @@ graph TD
   Extracting one 768-dimensional CLS vector per post is naturally GPU-friendly, but raw Hugging Face defaults do not parallelise the way this course expects. A stock script that simply calls `model(**token_batch)` inside a Python for-loop (`batch ≈ 32`, FP32 weights) keeps just a fraction of a single GPU busy and quickly bumps into VRAM limits.
 
 
-#### 2. Work Flow
+### Work Flow
 
-#### 2.1 Job overview
-We load the 21 million row WSB posts from their 200-part Parquet lake into Spark, strip URLs and markdown with vectorised regex, and keep only id, created_utc, ticker, and cleaned text. 
+#### Job overview
+We load the 21 million row WSB posts with identified stock tickers from their 200-part Parquet lake into Spark, strip URLs and markdown with vectorised regex, and keep only id, created_utc, ticker, and cleaned text. 
 
 Then, We also use spark to broadcast finBERT's tokenizer, so every core turns sentences into fixed-length token arrays that matches the model, which are saved back to Parquet already grouped by ticker. Finally, we use a Python driver to stream those tokens through FinBERT and generate embeddings.
 
-#### 2.2 Parellel Design
+#### Parellel Design
 
 
-##### 2.2.1 Data Cleaning
+##### Data Cleaning
 
 We use a local[32] Spark session to conduct basic cleaning of reddit texts.
 
@@ -362,14 +366,18 @@ All the code are running in midway. Please refer to sbatch file for detailed com
 
 ### Computational challenge
 
-Even trimmed down to the seven fields our model needs, the daily CRSP panel still contains **25 732 243 rows. Each experiment must
+### Computational challenge
 
-* **scan the full table once** and cache it in executor memory;
-* compute four overlapping **rolling realised-volatility windows** (1, 5, 22, 63 days) for every stock, yielding $\sim10^{10}$ element-wise operations;
-* **join** those daily σ-series with \~20 million Reddit-day observations on the composite key *(PERMNO, date)*;
-* feed the resulting 30 K-column design matrix into cross-validated Ridge models.
+Even after we prune the CRSP file to the **seven columns** we actually need, the daily panel still weighs in at **25  732  243 rows**.  Processing it is hard for three reasons:
 
-That workload is far beyond the memory and I/O budget of a laptop or single-node pandas script.  
+1. **Sheer volume of rolling math** – For every stock we must slide four overlapping windows (1, 5, 22, 63 days) across the entire date range.  That is on the order of **10 billion elementary operations**, impossible to hold in RAM or loop through in pandas.
+
+2. **High-cardinality join** – Each day-level σ vector has to be merged with roughly **20 million** Reddit-day records on the composite key *(PERMNO, date)*.  Without a distributed hash join this would devolve into an N × M Cartesian nightmare.
+
+3. **Wide design matrix for CV** – Once the join is done, every observation carries four HAR lags plus a 768-dim FinBERT vector, giving a huge column feature block.  Feeding that into a five-λ, three-fold Ridge grid means fitting **15 dense linear systems per window**, far beyond memory limit.
+
+Together these steps exceed both the I/O bandwidth and the memory footprint of any single-node setup, and justify the Spark-based, partition-by-PERMNO pipeline we run on Midway’s multi-core executors.
+
 
 
 ### Realised Volatility  
@@ -432,8 +440,7 @@ graph TD
 
 The rolling volatility is computed in parallel across executors, with each executor handling a single stock’s history. The `Window` function partitions the data by **PERMNO** and orders it by date, allowing Spark to compute the rolling volatility for each stock independently. The results are then written to a **Parquet** file partitioned by **PERMNO**, which allows efficient access to individual stocks in subsequent analyses.
 
-After building the four HAR-style volatility factors `vol_1, vol_5, vol_22, vol_63` and their future targets `y_1, y_5, y_22, y_63`, We ran a Spark-powered visual-diagnostics script The job loads the full 26 M-row *reddit_crsp* Parquet, directly on the cluster, and pushes three small DataFrames to pandas/matplotlib for plotting.*Spark* computes the group-by (daily mean RV) and rolling
-`cov`, `var` windows in-cluster; only ±50 k rows are collected for plotting.  End-to-end wall time on a 32-core Midway node:≈ 20 min for full data.
+After building the four HAR-style volatility factors `vol_1, vol_5, vol_22, vol_63` and their future targets `y_1, y_5, y_22, y_63`, We ran a Spark-powered visual-diagnostics script. The job loads the full 28 M-row *reddit_crsp* Parquet, directly on the cluster, and pushes three small DataFrames to pandas/matplotlib for plotting.*Spark* computes the group-by (daily mean RV) and rolling `cov`, `var` windows in-cluster. End-to-end wall time on a 12-core Midway node:≈ 20 min for full data.
 
 ![ Daily-average realised volatility](fig/vol_timeseries.png)
 
@@ -528,7 +535,7 @@ flowchart TD
     end
 ```
 
-# prediction model training and evaluation
+# Prediction model training and evaluation
 ## Benchmark model
 
 ### Model specification  
@@ -682,7 +689,7 @@ To keep a **768-dim FinBERT vector + 4 HAR lags** tractable, I apply five concre
 5. **Driver is a thin loop.**
    Python merely slices dates, launches CV, logs `λ*`, MSE, R², and moves the window forward; all heavy math—Gram matrices, ridge solves, predictions—happens on executors.
 
-With these tweaks the script walks from 2012 to 2020 (nine 4 y → 1 y windows, 45 CV fits) in **≈ 7 min** on a 32-core Midway node,increased from 40 min without optimization.
+With these tweaks the script walks from 2012 to 2020 (nine 4 y → 1 y windows, 45 CV fits) on a 16-core Midway node.
 
 
 # model evaluation
