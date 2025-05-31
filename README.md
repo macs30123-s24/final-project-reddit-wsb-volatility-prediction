@@ -22,6 +22,25 @@ We then train elastic-net and LSTM models in parallel to forecast daily realized
 Can sentiment embeddings extracted from Reddit’s r/WallStreetBets improve the prediction of stock volatility?
 
 
+# Readme Navigation
+
+## README Navigation
+| Main Section                                    | Description                                                         |
+|-------------------------------------------------|---------------------------------------------------------------------|
+| [Responsibilities](#responsibilities)           | Team members and division of labor                                   |
+| [Research Questions](#research-questions)       | Research questions guiding this project                              |
+| [Social Science Significance](#social-science-significance) | Social science significance of this study              |
+| [Data ingestion](#ingestion-append-ticker)   | Details of Reddit data ingestion and preprocessing pipeline          |
+| [Embedding generation](#embedding-generation)   | FinBERT embedding creation and parallelization                       |
+| [CRSP trade-and-quote data](#crsp-trade-and-quote-data) | Collection and processing of CRSP financial data    |
+| [Embedding ⇆ Financial data join](#embedding-⇆-financial-data-join) | Joining sentiment embeddings with financial data |
+| [Prediction model training and evaluation](#prediction-model-training-and-evaluation) | Training HAR and embedding models for volatility forecasting |
+| [Model evaluation](#model-evaluation)           | Benchmark and embedding model performance results                    |
+
+
+
+
+
 # Social Science Significance
 
 * **Beyond the Rationality Assumption**
@@ -41,10 +60,11 @@ Can sentiment embeddings extracted from Reddit’s r/WallStreetBets improve the 
 
 
 
-# 1. Reddit WSB post data
+# Reddit WSB post data
 
+## Ingestion-append-ticker
 
-### The code of this part is in [here](reddit/Merge/Merge_final_version.ipynb)
+### The code for ingestion is [Merge_final_version.ipynb](data/reddit/Merge/Merge_final_version.ipynb)
 
 ### Computational challenge
 
@@ -157,17 +177,21 @@ graph TD
   - `stage01_union_parquet/` → posts ∪ comments (88.9 M rows)  
   - `stage02_by_ticker/` → Parquet, partitioned by ticker, ready for FinBERT
 
-### Estimated improvements
+### Estimated performance evaluation
 
-| **Execution mode (EMR, 5 nodes)**                  | **Wall-time (cold run)\*** | **Why it matters**                                                                                   |
-| -------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------ |
-| Spark – Python fallback                            | ≈ 45 min                    | Partition-level parallelism already spreads decompression and parsing over 12 cores (3 executors × 4). |
-| *(each executor uses zstandard + JSON parsing in Python)* |                             |                                                                                                        |
-| Spark – JVM fast path                              | ≈ 30 min                    | Decompression shifts into the JVM; ingest phase roughly halves, the rest of the pipeline scales linearly with CPU. |
-| *Note: The *                    |                             |                                                                                                        |
+**Estimated JVM Fast-Path Runtime**
+- Our Python-fallback runk spent which spend around 25-30 minutes minutes on I/O + JSON parsing and ~10 minutes on subsequent cleaning/writing
+
+**Limitations of This Estimate**
+- Due to the environmental and resource constraint of AWS learner lab, we did not manage to install ZStandard codec and run the JVM version.
+
+- Since our Python-fallback run took ~30 minutes and the JVM fast-path historically halves the decompression + parsing stage—which accounted for roughly two-thirds of the runtime—their combination implies a total of about 18 minutes for the JVM approach.
+
+- The estimate relies on past experiments under similar cluster size and data volume, but differences in node specs, Spark parameters (e.g., `spark.sql.shuffle.partitions`), network/S3 latency, and EMR provisioning can easily introduce a ± 2–3 minute variance.
 
 
-## 1.2 Embedding generation
+## Embedding generation
+
 
 ### Computational bottleneck
 
@@ -191,7 +215,7 @@ Then, We also use spark to broadcast finBERT's tokenizer, so every core turns se
 #### Parellel Design
 
 
-##### Data Cleaning
+#### Data Cleaning (refer to [clean.ipynb](data/reddit/Embedding/clean.ipynb))
 
 We use a local[32] Spark session to conduct basic cleaning of reddit texts.
 
@@ -273,15 +297,14 @@ graph TD
 
 
 
-##### 2.2.3 Embedding
+#### Embedding
+
+Note: The code of tokenization + single GPU Embedding is [finbert_embedding.py](data/reddit/Embedding/finbert_pipeline.py), and the code of tokenization + multiple GPU embedding is [finbert_embedding.py](data/reddit/Embedding/finbert_pipeline1.py)
+
 
 We generate embedding pipeline under different computational resources: single GPU and multiple GPU. 
 
-For single GPU, we push mega-batches of ~2 000 sentences through FinBERT in FP16. This taps the card’s thousands of tensor cores simultaneously, while the host thread overlaps disk-to-RAM streaming and Parquet writing so we parallely conduct computations, memory transfers, and I/O process.
-
-
-
-##### Shared design across both scripts
+#### Shared design across both scripts
 
 - **All hand-rolled, no “auto-magic.”**  
   We do not call `accelerate`, `deepspeed`, or `DataParallel`. Instead, we write the scheduling logic ourselves so the course staff can see exactly where the parallelism lives.
@@ -297,14 +320,14 @@ For single GPU, we push mega-batches of ~2 000 sentences through FinBERT in FP16
 
 ---
 
-### Different hardware situations
+#### Different hardware situations
 
 | **Scenario**                  | **How we parallelise**                                                                                                                                               | **Why we keep it**                                                                                                                                 |
 |------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|
 | Single-GPU, `finbert_pipeline.py`  | One Python worker binds to the lone card, chews through fixed-size mega-batches, and writes a single Parquet shard.                                               | Acts as a baseline: shows that even without extra hardware we still employ batch-level parallelism and FP16 tricks to finish in a reasonable window. |
 | Multi-GPU, `finbert_pipeline1.py` | We call `torch.multiprocessing.spawn`, launching one identical worker per visible GPU. Batches are handed out round-robin (`batch_idx % world == rank`), so every card stays busy and no partition is processed twice. Each worker writes its own shard, giving near-linear scaling (4 × GPU ≈ 4 × speed). | Lets us study how much wall-time drops when we add hardware—perfect for the project’s “compare different parallel levels” goal.                    |
 
-#### 3. Computational environment:
+#### Computational environment:
 All the code are running in midway. Please refer to sbatch file for detailed computational resource.
 
 - **Cleaning + tokenisation node**  
@@ -331,7 +354,7 @@ All the code are running in midway. Please refer to sbatch file for detailed com
   Python 3.9.19 · PyTorch 2.2.1 (+ cu118) · CUDA 11.8 · HF Transformers 4.37.2 · Spark 3.3.2
 
 
-#### 4 Performance snapshot
+#### Performance snapshot
 
 - **Spark cleaning (32 CPU)**  
   Finishes in roughly **8 minutes**, streaming 21 million rows through the regex filters without memory pressure.
@@ -356,6 +379,8 @@ All the code are running in midway. Please refer to sbatch file for detailed com
 - **Data Period**: 2012-2024
 - **Data Source**: [CRSP](https://www.crsp.org/products/documentation/crsp-daily-stock-prices-and-volume) 
 - **Data Size**: 25732243 records.
+
+### Computational challenge
 
 ### Computational challenge
 
@@ -532,10 +557,10 @@ flowchart TD
 ### Model specification  
 For every stock **i** and day **t** we predict next-day realised volatility  
 
-```math
+$$
 \hat{y}_{i,t+1}
   \;=\;
-  \beta^{\!\top}
+  \boldsymbol{\beta}^{\!\top}
   \bigl[1,\,
         \sigma_{i,t}^{(1)},\,
         \sigma_{i,t}^{(5)},\,
@@ -543,7 +568,7 @@ For every stock **i** and day **t** we predict next-day realised volatility
         \sigma_{i,t}^{(63)}\bigr]^{\!\top}
   \;+\;
   \varepsilon_{i,t+1}.
-```
+$$
 
 
 where σ\* are the rolling volatilities produced in the previous step.  
@@ -596,10 +621,10 @@ We extend the baseline **HAR(1 / 5 / 22 / 63)** specification by injecting a hig
 \sigma_{t+1}
   = \beta_0
   + \underbrace{\beta_1 \sigma_t}_{\text{daily}}
-  + \underbrace{\beta_5\,\bar{\sigma}_{t-4·t}}_{\text{weekly}}
-  + \underbrace{\beta_{22}\,\bar{\sigma}_{t-21·t}}_{\text{monthly}}
-  + \underbrace{\beta_{63}\,\bar{\sigma}_{t-62·t}}_{\text{quarterly}}
-  + \underbrace{{\gamma}^{\!\top}\mathbf{e}_t}_{\text{FinBERT}}
+  + \underbrace{\beta_5\,\bar{\sigma}_{t-4:t}}_{\text{weekly}}
+  + \underbrace{\beta_{22}\,\bar{\sigma}_{t-21:t}}_{\text{monthly}}
+  + \underbrace{\beta_{63}\,\bar{\sigma}_{t-62:t}}_{\text{quarterly}}
+  + \underbrace{\boldsymbol{\gamma}^{\!\top}\mathbf{e}_t}_{\text{FinBERT}}
   + \varepsilon_{t+1}
 ```
 
@@ -672,7 +697,7 @@ To keep a **768-dim FinBERT vector + 4 HAR lags** tractable, I apply five concre
 5. **Driver is a thin loop.**
    Python merely slices dates, launches CV, logs `λ*`, MSE, R², and moves the window forward; all heavy math—Gram matrices, ridge solves, predictions—happens on executors.
 
-With these tweaks the script walks from 2012 to 2020 (nine 4 y → 1 y windows, 45 CV fits) in **≈ 7 min** on a 32-core Midway node,increased from 40 min without optimization.
+With these tweaks the script walks from 2012 to 2020 (nine 3 y →1 y → 1 y windows, 45 CV fits) in  on a 32-core Midway node,increased from 40 min without optimization.
 
 
 # model evaluation
